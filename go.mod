@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/aws/aws-sdk-go v1.55.8
-	github.com/aws/aws-sdk-go-v2 v1.41.9
+	github.com/aws/aws-sdk-go-v2 v1.41.12
 	github.com/aws/aws-sdk-go-v2/config v1.28.11
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.71
 	github.com/aws/aws-sdk-go-v2/service/amp v1.36.0
@@ -37,7 +37,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.34.1
 	github.com/aws/aws-sdk-go-v2/service/textract v1.40.22
 	github.com/aws/aws-sdk-go-v2/service/transfer v1.55.5
-	github.com/aws/smithy-go v1.26.0
+	github.com/aws/smithy-go v1.27.1
 	github.com/ekristen/libnuke v1.3.0
 	github.com/fatih/color v1.19.0
 	github.com/golang/mock v1.6.0
