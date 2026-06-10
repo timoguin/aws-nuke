@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/sirupsen/logrus"
-
-	"github.com/aws/aws-sdk-go/aws"         //nolint:staticcheck
-	"github.com/aws/aws-sdk-go/service/ecs" //nolint:staticcheck
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 
 	"github.com/ekristen/libnuke/pkg/registry"
 	"github.com/ekristen/libnuke/pkg/resource"
@@ -27,74 +26,89 @@ func init() {
 	})
 }
 
-type ECSServiceLister struct{}
+type ECSServiceClient interface {
+	ListClusters(ctx context.Context, params *ecs.ListClustersInput,
+		optFns ...func(*ecs.Options)) (*ecs.ListClustersOutput, error)
+	ListServices(ctx context.Context, params *ecs.ListServicesInput,
+		optFns ...func(*ecs.Options)) (*ecs.ListServicesOutput, error)
+	DescribeServices(ctx context.Context, params *ecs.DescribeServicesInput,
+		optFns ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
+	DeleteService(ctx context.Context, params *ecs.DeleteServiceInput,
+		optFns ...func(*ecs.Options)) (*ecs.DeleteServiceOutput, error)
+	DeleteExpressGatewayService(ctx context.Context, params *ecs.DeleteExpressGatewayServiceInput,
+		optFns ...func(*ecs.Options)) (*ecs.DeleteExpressGatewayServiceOutput, error)
+}
 
-func (l *ECSServiceLister) List(_ context.Context, o interface{}) ([]resource.Resource, error) {
+type ECSServiceLister struct {
+	mockSvc ECSServiceClient
+}
+
+func (l *ECSServiceLister) List(ctx context.Context, o interface{}) ([]resource.Resource, error) {
 	opts := o.(*nuke.ListerOpts)
 
-	svc := ecs.New(opts.Session)
+	var svc ECSServiceClient
+	if l.mockSvc != nil {
+		svc = l.mockSvc
+	} else {
+		svc = ecs.NewFromConfig(*opts.Config)
+	}
+
 	resources := make([]resource.Resource, 0)
-	clusters := []*string{}
+	clusters := make([]string, 0)
 
 	clusterParams := &ecs.ListClustersInput{
-		MaxResults: aws.Int64(100),
+		MaxResults: aws.Int32(100),
 	}
 
 	// Iterate over clusters to ensure we dont presume its always default associations
-	for {
-		output, err := svc.ListClusters(clusterParams)
+	clusterPaginator := ecs.NewListClustersPaginator(svc, clusterParams)
+	for clusterPaginator.HasMorePages() {
+		output, err := clusterPaginator.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
 
 		clusters = append(clusters, output.ClusterArns...)
-
-		if output.NextToken == nil {
-			break
-		}
-
-		clusterParams.NextToken = output.NextToken
 	}
 
 	// Iterate over known clusters and discover their instances
 	// to prevent assuming default is always used
 	for _, clusterArn := range clusters {
 		serviceParams := &ecs.ListServicesInput{
-			Cluster:    clusterArn,
-			MaxResults: aws.Int64(10),
+			Cluster:    aws.String(clusterArn),
+			MaxResults: aws.Int32(10),
 		}
 
-		for {
-			output, err := svc.ListServices(serviceParams)
+		servicePaginator := ecs.NewListServicesPaginator(svc, serviceParams)
+		for servicePaginator.HasMorePages() {
+			output, err := servicePaginator.NextPage(ctx)
 			if err != nil {
 				return nil, err
 			}
 
-			for _, serviceArn := range output.ServiceArns {
-				ecsService := &ECSService{
-					svc:        svc,
-					ServiceARN: serviceArn,
-					ClusterARN: clusterArn,
-				}
-
-				// Fetch tags for the service
-				tags, err := svc.ListTagsForResource(&ecs.ListTagsForResourceInput{
-					ResourceArn: serviceArn,
+			for _, serviceArns := range chunkECSServiceARNs(output.ServiceArns, 10) {
+				services, err := svc.DescribeServices(ctx, &ecs.DescribeServicesInput{
+					Cluster:  aws.String(clusterArn),
+					Services: serviceArns,
+					Include:  []ecstypes.ServiceField{ecstypes.ServiceFieldTags},
 				})
 				if err != nil {
-					logrus.WithError(err).Error("unable to get tags for ECS service")
-				} else if tags != nil {
-					ecsService.Tags = tags.Tags
+					return nil, err
+				}
+				if len(services.Failures) > 0 {
+					return nil, fmt.Errorf("failed to describe ECS services: %v", services.Failures)
 				}
 
-				resources = append(resources, ecsService)
+				for _, service := range services.Services {
+					resources = append(resources, &ECSService{
+						svc:                    svc,
+						ServiceARN:             service.ServiceArn,
+						ClusterARN:             service.ClusterArn,
+						ResourceManagementType: string(service.ResourceManagementType),
+						Tags:                   service.Tags,
+					})
+				}
 			}
-
-			if output.NextToken == nil {
-				break
-			}
-
-			serviceParams.NextToken = output.NextToken
 		}
 	}
 
@@ -102,18 +116,27 @@ func (l *ECSServiceLister) List(_ context.Context, o interface{}) ([]resource.Re
 }
 
 type ECSService struct {
-	svc        *ecs.ECS
-	ServiceARN *string    `description:"The ARN of the ECS service"`
-	ClusterARN *string    `description:"The ARN of the ECS cluster"`
-	Tags       []*ecs.Tag `description:"The tags associated with the service"`
+	svc                    ECSServiceClient
+	ServiceARN             *string        `description:"The ARN of the ECS service"`
+	ClusterARN             *string        `description:"The ARN of the ECS cluster"`
+	ResourceManagementType string         `description:"Whether the ECS service is managed by the customer or by ECS"`
+	Tags                   []ecstypes.Tag `description:"The tags associated with the service"`
 }
 
 func (f *ECSService) Properties() types.Properties {
 	return types.NewPropertiesFromStruct(f)
 }
 
-func (f *ECSService) Remove(_ context.Context) error {
-	_, err := f.svc.DeleteService(&ecs.DeleteServiceInput{
+func (f *ECSService) Remove(ctx context.Context) error {
+	if f.ResourceManagementType == string(ecstypes.ResourceManagementTypeEcs) {
+		_, err := f.svc.DeleteExpressGatewayService(ctx, &ecs.DeleteExpressGatewayServiceInput{
+			ServiceArn: f.ServiceARN,
+		})
+
+		return err
+	}
+
+	_, err := f.svc.DeleteService(ctx, &ecs.DeleteServiceInput{
 		Cluster: f.ClusterARN,
 		Service: f.ServiceARN,
 		Force:   aws.Bool(true),
@@ -124,4 +147,22 @@ func (f *ECSService) Remove(_ context.Context) error {
 
 func (f *ECSService) String() string {
 	return fmt.Sprintf("%s -> %s", *f.ServiceARN, *f.ClusterARN)
+}
+
+func chunkECSServiceARNs(serviceArns []string, size int) [][]string {
+	if size <= 0 {
+		return nil
+	}
+
+	chunks := make([][]string, 0, (len(serviceArns)+size-1)/size)
+	for start := 0; start < len(serviceArns); start += size {
+		end := start + size
+		if end > len(serviceArns) {
+			end = len(serviceArns)
+		}
+
+		chunks = append(chunks, serviceArns[start:end])
+	}
+
+	return chunks
 }

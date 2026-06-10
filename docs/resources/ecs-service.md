@@ -15,6 +15,7 @@ ECSService
 
 
 - `ClusterARN`: The ARN of the ECS cluster
+- `ResourceManagementType`: Whether the ECS service is managed by the customer or by ECS
 - `ServiceARN`: The ARN of the ECS service
 - `tag:<key>:`: This resource has tags with property `Tags`. These are key/value pairs that are
 	added as their own property with the prefix of `tag:` (e.g. [tag:example: "value"]) 
@@ -30,4 +31,3 @@ resources support properties. To write a filter against the string representatio
 the filter.
 
 The string value is always what is used in the output of the log format when a resource is identified.
-
